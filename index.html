@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>PULSE JUMP — one-button arcade runner</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: #0b0618; min-height: 100%; }
+  body {
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    color: #f2ecff; display: flex; flex-direction: column; align-items: center;
+    padding: 18px 12px 28px;
+  }
+  h1 {
+    font-size: clamp(30px, 6vw, 54px); letter-spacing: 4px; font-weight: 900;
+    background: linear-gradient(90deg, #ff2d95, #ffb300, #22e6ff);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    text-align: center; line-height: 1.05;
+  }
+  .tag {
+    margin-top: 6px; color: #b9a8e8; font-size: clamp(13px, 2.4vw, 18px);
+    text-align: center; letter-spacing: 1px;
+  }
+  .tag b { color: #ffd166; }
+  #wrap { width: 100%; max-width: 960px; margin-top: 16px; }
+  canvas {
+    display: block; width: 100%; height: auto; border-radius: 14px;
+    border: 2px solid #3d2a6e; background: #12082a;
+    touch-action: none; box-shadow: 0 0 42px rgba(255, 45, 149, .25);
+  }
+  .hint {
+    margin-top: 12px; text-align: center; color: #b9a8e8;
+    font-size: clamp(13px, 2.4vw, 17px); line-height: 1.7;
+  }
+  .hint kbd {
+    background: #241640; border: 1px solid #5b4396; border-bottom-width: 3px;
+    border-radius: 6px; padding: 1px 9px; color: #fff; font-family: inherit;
+  }
+  .btns { display: flex; gap: 10px; justify-content: center; margin-top: 14px; flex-wrap: wrap; }
+  button {
+    font: inherit; font-weight: 700; font-size: 16px; color: #fff;
+    background: linear-gradient(90deg, #ff2d95, #7b2fff); border: none;
+    border-radius: 999px; padding: 11px 26px; cursor: pointer;
+  }
+  button.ghost { background: #241640; border: 1px solid #5b4396; }
+  .foot { margin-top: 16px; color: #6f5da0; font-size: 13px; text-align: center; }
+  .foot a { color: #9d7bff; }
+</style>
+</head>
+<body>
+  <h1>PULSE JUMP</h1>
+  <div class="tag">One button. One robot. How far can you run? &middot; <b>Nhấn để nhảy — Nhảy qua gai, ăn xu!</b></div>
+  <div id="wrap">
+    <canvas id="game" width="960" height="540"></canvas>
+  </div>
+  <div class="hint">
+    <kbd>Space</kbd> / <kbd>Click</kbd> / <kbd>Tap</kbd> to jump &middot; <kbd>P</kbd> pause &middot; <kbd>R</kbd> restart<br>
+    Jump the spikes, grab the coins, survive as the speed rises. 3 lives.
+  </div>
+  <div class="btns">
+    <button id="startBtn">▶ Start</button>
+    <button id="pauseBtn" class="ghost">❚❚ Pause</button>
+    <button id="soundBtn" class="ghost">🔊 Sound: on</button>
+  </div>
+  <div class="foot">PULSE JUMP — a tiny browser game built by an AI agent from one prompt, for <a href="https://make.fun/bounty/post-x-the-agent-builds-a-game-from-20261122-1709">make.fun</a>.</div>
+<script>
+'use strict';
+/* PULSE JUMP — a one-button arcade runner.
+   The robot runs on its own. You only jump: over the spikes, into the coins.
+   Fixed 60 Hz timestep, seeded RNG, autopilot + frozen screenshot mode (?seed=&shot=&autoplay=). */
+const W = 960, H = 540, GROUND_Y = 470, STEP = 1 / 60;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+const params = new URLSearchParams(location.search);
+const SEED = parseInt(params.get('seed') || '1337', 10) || 1337;
+const SHOT_AT = parseFloat(params.get('shot') || '0') || 0;
+const AUTOPLAY = params.get('autoplay') === '1';
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+let rng = mulberry32(SEED);
+const rand = (a, b) => a + rng() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const hit = (a, b) => {
+  const dx = a.x - b.x, dy = a.y - b.y, rr = a.r + b.r;
+  return dx * dx + dy * dy < rr * rr;
+};
+
+/* ---------- audio (lazy, never breaks the game) ---------- */
+let audioCtx = null, soundOn = true;
+function beep(freq, dur, type, vol) {
+  if (!soundOn || SHOT_AT > 0) return;
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type || 'square'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol || 0.06, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch (e) { /* audio is decoration */ }
+}
+
+/* ---------- game state ---------- */
+let state = 'title';           // title | playing | paused | over
+let score = 0, coins = 0, lives = 3, level = 1, timeSec = 0;
+let speed = 260, dist = 0, invuln = 0, frozen = false;
+let spikes = [], coinsArr = [], parts = [], stars = [], hills = [];
+let best = 0;
+try { best = parseInt(localStorage.getItem('pulsejump-best') || '0', 10) || 0; } catch (e) {}
+
+const player = { x: 140, y: GROUND_Y - 52, w: 44, h: 52, vy: 0, onGround: true, r: 24, blink: 0 };
+
+function resetGame() {
+  rng = mulberry32(SEED);
+  score = 0; coins = 0; lives = 3; level = 1; timeSec = 0;
+  speed = 260; dist = 0; invuln = 0;
+  spikes = []; coinsArr = []; parts = [];
+  stars = []; hills = [];
+  for (let i = 0; i < 90; i++) stars.push({ x: rand(0, W), y: rand(0, 300), r: rand(0.6, 2.2), tw: rand(0, 6.28) });
+  for (let i = 0; i < 7; i++) hills.push({ x: i * 170, w: rand(120, 220), h: rand(50, 130) });
+  player.y = GROUND_Y - player.h; player.vy = 0; player.onGround = true;
+  spawnTimer = 0.6;
+}
+let spawnTimer = 0.6;
+
+function startGame() {
+  resetGame();
+  state = 'playing';
+  document.getElementById('startBtn').textContent = '↻ Restart';
+}
+
+function gameOver() {
+  state = 'over';
+  if (score > best) {
+    best = Math.floor(score);
+    try { localStorage.setItem('pulsejump-best', String(best)); } catch (e) {}
+  }
+  beep(140, 0.5, 'sawtooth', 0.08);
+}
+
+function jump() {
+  if (state === 'title' || state === 'over') { startGame(); return; }
+  if (state !== 'playing') return;
+  if (player.onGround) {
+    player.vy = -830;
+    player.onGround = false;
+    beep(520, 0.09, 'square', 0.05);
+    burst(player.x, GROUND_Y, 6, '#8ef6ff');
+  }
+}
+
+function burst(x, y, n, color) {
+  for (let i = 0; i < n; i++) {
+    parts.push({ x, y, vx: rand(-160, 160), vy: rand(-220, 40), life: rand(0.3, 0.7), max: 0.7, r: rand(2, 5), color });
+  }
+}
+
+function spawnPattern() {
+  const kind = rng();
+  const x = W + 60;
+  if (kind < 0.45) {
+    // single spike, sometimes with a coin arc above it
+    const h = rand(42, 66);
+    spikes.push({ x, y: GROUND_Y, w: rand(34, 46), h, r: 22 });
+    if (rng() < 0.6) {
+      for (let i = -1; i <= 1; i++) coinsArr.push({ x: x + i * 34, y: GROUND_Y - 150 - Math.abs(i) * -18 - 40, r: 12, taken: false, ph: rand(0, 6) });
+    }
+  } else if (kind < 0.7) {
+    // double spike — needs a well-timed jump
+    const h1 = rand(40, 58), h2 = rand(44, 62);
+    spikes.push({ x, y: GROUND_Y, w: 36, h: h1, r: 21 });
+    spikes.push({ x: x + 52, y: GROUND_Y, w: 36, h: h2, r: 21 });
+    coinsArr.push({ x: x + 26, y: GROUND_Y - 190, r: 12, taken: false, ph: 0 });
+  } else if (kind < 0.88) {
+    // coin trail in the air — jump to grab them all
+    for (let i = 0; i < 5; i++) coinsArr.push({ x: x + i * 36, y: GROUND_Y - 120 - Math.sin(i / 4 * Math.PI) * 70, r: 12, taken: false, ph: i * 0.7 });
+  } else {
+    // low spike + high coins: jump late, stay up
+    spikes.push({ x, y: GROUND_Y, w: 40, h: 34, r: 18 });
+    for (let i = 0; i < 3; i++) coinsArr.push({ x: x + 20 + i * 36, y: GROUND_Y - 210, r: 12, taken: false, ph: i });
+  }
+}
+
+function update(dt) {
+  if (state !== 'playing' || frozen) return;
+  timeSec += dt;
+  dist += speed * dt;
+  score = dist * 0.06 + coins * 25;
+  level = Math.min(9, Math.floor(score / 250) + 1);
+  speed = Math.min(520, 260 + (level - 1) * 26 + timeSec * 1.2);
+  if (invuln > 0) invuln -= dt;
+
+  // player physics
+  player.vy += 2400 * dt;
+  player.y += player.vy * dt;
+  if (player.y >= GROUND_Y - player.h) {
+    player.y = GROUND_Y - player.h; player.vy = 0; player.onGround = true;
+  } else player.onGround = false;
+
+  // spawn
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) {
+    spawnPattern();
+    spawnTimer = rand(0.75, 1.35) * (300 / speed);
+  }
+
+  // move world
+  for (const s of spikes) s.x -= speed * dt;
+  for (const c of coinsArr) { c.x -= speed * dt; c.ph += dt * 4; }
+  for (const h of hills) { h.x -= speed * 0.25 * dt; if (h.x + h.w < 0) { h.x = W + rand(0, 80); h.w = rand(120, 220); h.h = rand(50, 130); } }
+  for (const st of stars) { st.tw += dt * 2; }
+  spikes = spikes.filter(s => s.x + s.w > -80);
+  coinsArr = coinsArr.filter(c => c.x > -40 && !c.taken);
+
+  // particles
+  for (const p of parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 500 * dt; p.life -= dt; }
+  parts = parts.filter(p => p.life > 0);
+
+  // collisions
+  const pc = { x: player.x, y: player.y + 26, r: 22 };
+  for (const c of coinsArr) {
+    if (!c.taken && hit(pc, { x: c.x, y: c.y + Math.sin(c.ph) * 4, r: 14 })) {
+      c.taken = true; coins++;
+      burst(c.x, c.y, 12, '#ffd166');
+      beep(880 + coins * 12, 0.08, 'sine', 0.07);
+    }
+  }
+  if (invuln <= 0) {
+    for (const s of spikes) {
+      const sc = { x: s.x + s.w / 2, y: GROUND_Y - s.h / 2 + 6, r: Math.min(s.w, s.h) * 0.42 };
+      if (hit(pc, sc)) {
+        lives--; invuln = 1.5;
+        burst(player.x, player.y + 20, 22, '#ff2d95');
+        beep(180, 0.25, 'sawtooth', 0.09);
+        if (lives <= 0) { gameOver(); }
+        break;
+      }
+    }
+  }
+
+  if (AUTOPLAY) autopilot();
+}
+
+function autopilot() {
+  if (state !== 'playing' || !player.onGround) return;
+  // jump when the nearest spike ahead is close enough to clear
+  let near = null;
+  for (const s of spikes) {
+    if (s.x + s.w > player.x - 10 && s.x < player.x + 320) { near = s; break; }
+  }
+  if (near) {
+    const gap = near.x - player.x;
+    const lead = 165 + speed * 0.16;
+    if (gap < lead) jump();
+  }
+}
+
+/* ---------- drawing ---------- */
+function drawSpike(s) {
+  ctx.fillStyle = '#ff2d55';
+  ctx.strokeStyle = '#ff8fb3';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(s.x, GROUND_Y);
+  ctx.lineTo(s.x + s.w / 2, GROUND_Y - s.h);
+  ctx.lineTo(s.x + s.w, GROUND_Y);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(s.x + s.w / 2, GROUND_Y - s.h + 10, 3, 0, 6.29);
+  ctx.fill();
+}
+
+function drawRobot(x, y) {
+  // little neon robot: rounded body, visor eye, antenna, running legs
+  const bob = player.onGround ? Math.sin(timeSec * 18) * 2 : 0;
+  ctx.save();
+  ctx.translate(x, y + bob);
+  if (invuln > 0 && Math.floor(timeSec * 14) % 2 === 0) ctx.globalAlpha = 0.35;
+  // legs
+  ctx.fillStyle = '#22e6ff';
+  const legSwing = player.onGround ? Math.sin(timeSec * 18) * 8 : 6;
+  ctx.fillRect(-14, 34 + legSwing * 0.4, 9, 18 - legSwing * 0.4);
+  ctx.fillRect(5, 34 - legSwing * 0.4, 9, 18 + legSwing * 0.4);
+  // body
+  const grad = ctx.createLinearGradient(0, 0, 0, 52);
+  grad.addColorStop(0, '#7b2fff'); grad.addColorStop(1, '#ff2d95');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.roundRect(-22, -2, 44, 40, 10); ctx.fill();
+  ctx.strokeStyle = '#ffffff88'; ctx.lineWidth = 2; ctx.stroke();
+  // visor eye
+  ctx.fillStyle = '#0b0618';
+  ctx.beginPath(); ctx.roundRect(-15, 7, 30, 12, 6); ctx.fill();
+  ctx.fillStyle = '#8ef6ff';
+  ctx.beginPath(); ctx.arc(6, 13, 4, 0, 6.29); ctx.fill();
+  // antenna
+  ctx.strokeStyle = '#ffd166'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(0, -2); ctx.lineTo(0, -14); ctx.stroke();
+  ctx.fillStyle = '#ffd166';
+  ctx.beginPath(); ctx.arc(0, -17, 4.5, 0, 6.29); ctx.fill();
+  // arm
+  ctx.strokeStyle = '#22e6ff'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(18, 12); ctx.lineTo(30, 22 + Math.sin(timeSec * 18) * 4); ctx.stroke();
+  ctx.restore();
+}
+
+function drawCoin(c) {
+  const y = c.y + Math.sin(c.ph) * 4;
+  ctx.save();
+  ctx.translate(c.x, y);
+  ctx.fillStyle = '#ffd166';
+  ctx.beginPath(); ctx.arc(0, 0, 12, 0, 6.29); ctx.fill();
+  ctx.strokeStyle = '#ff9d00'; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = '#8a5a00';
+  ctx.font = 'bold 15px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('★', 0, 1);
+  ctx.restore();
+}
+
+function draw() {
+  // sky
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#12082a'); sky.addColorStop(0.7, '#1d0b3d'); sky.addColorStop(1, '#2a0f4d');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+  // stars
+  for (const s of stars) {
+    ctx.globalAlpha = 0.4 + 0.6 * Math.abs(Math.sin(s.tw));
+    ctx.fillStyle = '#cfe8ff';
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 6.29); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // moon
+  ctx.fillStyle = '#ffe9a8';
+  ctx.beginPath(); ctx.arc(840, 74, 34, 0, 6.29); ctx.fill();
+  ctx.fillStyle = '#f5cf6e';
+  ctx.beginPath(); ctx.arc(830, 66, 7, 0, 6.29); ctx.arc(852, 84, 5, 0, 6.29); ctx.fill();
+  // hills / city silhouette
+  ctx.fillStyle = '#170a33';
+  for (const h of hills) {
+    ctx.beginPath();
+    ctx.moveTo(h.x, GROUND_Y);
+    ctx.quadraticCurveTo(h.x + h.w / 2, GROUND_Y - h.h, h.x + h.w, GROUND_Y);
+    ctx.closePath(); ctx.fill();
+  }
+  // ground
+  ctx.fillStyle = '#241640'; ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+  ctx.fillStyle = '#ff2d95'; ctx.fillRect(0, GROUND_Y, W, 3);
+  ctx.fillStyle = '#3d2a6e';
+  for (let x = (0 - (dist * 1) % 46); x < W; x += 46) ctx.fillRect(x, GROUND_Y + 34, 24, 4);
+
+  // entities
+  for (const c of coinsArr) drawCoin(c);
+  for (const s of spikes) drawSpike(s);
+  for (const p of parts) {
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.29); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  if (state !== 'over') drawRobot(player.x, player.y);
+
+  drawHUD();
+
+  if (state === 'title') {
+    ctx.fillStyle = 'rgba(11,6,24,0.62)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.font = '900 54px sans-serif';
+    ctx.fillText('PULSE JUMP', W / 2, 190);
+    ctx.fillStyle = '#ffd166';
+    ctx.font = '700 24px sans-serif';
+    ctx.fillText('One button. One robot. How far can you run?', W / 2, 238);
+    ctx.fillStyle = '#b9a8e8';
+    ctx.font = '20px sans-serif';
+    ctx.fillText('Press SPACE, click or tap to jump — over the spikes, into the coins.', W / 2, 300);
+    ctx.fillStyle = '#22e6ff';
+    ctx.font = 'bold 22px sans-serif';
+    ctx.fillText('▶  TAP TO START  ◀', W / 2, 360);
+    if (best > 0) {
+      ctx.fillStyle = '#b9a8e8'; ctx.font = '18px sans-serif';
+      ctx.fillText('Best score: ' + best, W / 2, 400);
+    }
+  }
+  if (state === 'over') {
+    ctx.fillStyle = 'rgba(11,6,24,0.68)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff5d7a';
+    ctx.font = '900 52px sans-serif';
+    ctx.fillText('GAME OVER', W / 2, 200);
+    ctx.fillStyle = '#fff';
+    ctx.font = '700 30px sans-serif';
+    ctx.fillText('Score  ' + Math.floor(score), W / 2, 258);
+    ctx.fillStyle = '#ffd166'; ctx.font = '22px sans-serif';
+    ctx.fillText('Coins ' + coins + '   ·   Level ' + level + '   ·   ' + timeSec.toFixed(1) + 's', W / 2, 300);
+    if (Math.floor(score) >= best && best > 0) {
+      ctx.fillStyle = '#22e6ff'; ctx.font = 'bold 22px sans-serif';
+      ctx.fillText('★ NEW BEST! ★', W / 2, 338);
+    }
+    ctx.fillStyle = '#b9a8e8'; ctx.font = '20px sans-serif';
+    ctx.fillText('Press R, Space or tap to run again', W / 2, 388);
+  }
+  if (state === 'paused') {
+    ctx.fillStyle = 'rgba(11,6,24,0.6)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff'; ctx.font = '900 46px sans-serif';
+    ctx.fillText('❚❚ PAUSED', W / 2, 270);
+  }
+}
+
+function drawHUD() {
+  // top bar
+  ctx.fillStyle = 'rgba(11,6,24,0.72)';
+  ctx.fillRect(0, 0, W, 56);
+  ctx.fillStyle = '#3d2a6e'; ctx.fillRect(0, 56, W, 2);
+  ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 22px sans-serif';
+  ctx.fillText('SCORE ' + Math.floor(score), 16, 29);
+  // hearts
+  for (let i = 0; i < 3; i++) {
+    ctx.font = '22px sans-serif';
+    ctx.fillText(i < lives ? '❤️' : '🖤', 218 + i * 32, 29);
+  }
+  ctx.fillStyle = '#ffd166'; ctx.font = 'bold 20px sans-serif';
+  ctx.fillText('★ ' + coins, 330, 29);
+  ctx.fillStyle = '#22e6ff';
+  ctx.fillText('LV ' + level, 420, 29);
+  ctx.fillStyle = '#b9a8e8'; ctx.font = '20px sans-serif';
+  ctx.fillText('⏱ ' + timeSec.toFixed(1) + 's', 500, 29);
+  // progress to next level
+  const prog = (score % 250) / 250;
+  ctx.fillStyle = '#241640';
+  ctx.fillRect(640, 20, 200, 14);
+  ctx.fillStyle = '#ff2d95';
+  ctx.fillRect(640, 20, 200 * prog, 14);
+  ctx.fillStyle = '#b9a8e8'; ctx.font = '15px sans-serif';
+  ctx.fillText('next LV', 848, 29);
+  // speed
+  ctx.fillStyle = '#8ef6ff'; ctx.font = 'bold 15px sans-serif';
+  ctx.fillText('SPEED ×' + (speed / 260).toFixed(1), 16, 76);
+}
+
+/* ---------- input ---------- */
+function togglePause() {
+  if (state === 'playing') { state = 'paused'; }
+  else if (state === 'paused') { state = 'playing'; }
+}
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') { e.preventDefault(); jump(); }
+  else if (e.code === 'KeyP') togglePause();
+  else if (e.code === 'KeyR') startGame();
+});
+canvas.addEventListener('pointerdown', (e) => { e.preventDefault(); jump(); });
+document.getElementById('startBtn').addEventListener('click', () => {
+  if (state === 'playing') startGame(); else startGame();
+});
+document.getElementById('pauseBtn').addEventListener('click', togglePause);
+document.getElementById('soundBtn').addEventListener('click', (e) => {
+  soundOn = !soundOn;
+  e.target.textContent = soundOn ? '🔊 Sound: on' : '🔇 Sound: off';
+});
+
+/* ---------- main loop: fixed timestep ---------- */
+let last = 0, acc = 0;
+function frame(ts) {
+  requestAnimationFrame(frame);
+  if (!last) last = ts;
+  let dt = (ts - last) / 1000; last = ts;
+  if (dt > 0.25) dt = 0.25;
+  if (state === 'playing') {
+    acc += dt;
+    while (acc >= STEP) { update(STEP); acc -= STEP; }
+  }
+  draw();
+}
+
+/* ---------- screenshot mode: pre-simulate, then freeze ---------- */
+resetGame();
+if (SHOT_AT > 0) {
+  soundOn = false;
+  startGame();
+  for (let i = 0; i < Math.round(SHOT_AT * 60); i++) {
+    if (state !== 'playing') break;
+    autopilot();
+    update(STEP);
+  }
+  timeSec = SHOT_AT;
+  frozen = true;
+} else if (AUTOPLAY) {
+  startGame();
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
